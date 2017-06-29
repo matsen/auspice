@@ -130,7 +130,7 @@ class Splash extends React.Component {
             <h1 style={{textAlign: "center"}}> Real-time tracking of virus evolution </h1>
           </div>
 
-    			<p style={styles.introText}>
+          <p style={styles.introText}>
             Nextstrain is an open-source project to harness the scientific and public health potential of pathogen genome data. We provide a continually-updated view of publicly available data with powerful analytics and visualizations showing pathogen evolution and epidemic spread. Our goal is to aid epidemiological understanding and improve outbreak response.
           </p>
 
@@ -151,7 +151,7 @@ class Splash extends React.Component {
             <div className="col-md-1"/>
             <div className="col-md-10">
               <div className="row">
-        				<div className="col-sm-4">
+                <div className="col-sm-4">
                   {generateCard(["Ebola"], require("../images/ebola.png"), "/ebola", false)}
                 </div>
                 <div className="col-sm-4">
@@ -159,6 +159,9 @@ class Splash extends React.Component {
                 </div>
                 <div className="col-sm-4">
                   {generateCard(["Seasonal Influenza"], require("../images/influenza.png"), "/flu/h3n2/ha", false)}
+                </div>
+                <div className="col-sm-4">
+                  {generateCard(["Mumps"], require("../images/mumps.jpg"), "/mumps", false)}
                 </div>
                 <div className="col-sm-4">
                   {generateCard(["Avian Influenza", "A/H7N9"], require("../images/H7N9.png"), "/avian/h7n9", false)}

@@ -43,6 +43,7 @@ class Root extends React.Component {
               <Route path="/flu*" component={App}/>
               <Route path="/avian*" component={App}/>
               <Route path="/dengue*" component={App}/>
+              <Route path="/mumps*" component={App}/>
               <Route path="*" component={Splash}/>
             </Switch>
           </div>

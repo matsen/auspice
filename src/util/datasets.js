@@ -50,6 +50,7 @@ export const datasets = {
         "default": "h3n2"
       }
     },
+    "mumps": "",
     "default": "zika"
   }
 };
