@@ -50,7 +50,13 @@ export const datasets = {
         "default": "h3n2"
       }
     },
-    "mumps": "",
+    "mumps": {
+      "context": {
+        "global": "",
+        "bc": "",
+        "default": "global"
+      }
+    },
     "default": "zika"
   }
 };
