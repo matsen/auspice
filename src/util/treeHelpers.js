@@ -135,7 +135,7 @@ export const calcBranchThickness = function (nodes, visibility, rootIdx) {
     maxTipCount = 1;
   }
   return nodes.map((d, idx) => (
-    visibility[idx] === "visible" ? freqScale(d.tipCount / maxTipCount) : 1
+    visibility[idx] === "visible" ? freqScale((d.tipCount + 5) / (maxTipCount + 5)) : 1
   ));
 };
 
@@ -199,10 +199,9 @@ const parseFilterQuery = function (query) {
   };
 };
 
-
 /* recursively mark the parents of a given node active
 by setting the node idx to true in the param visArray */
-export const makeParentVisible = function (visArray, node) {
+const makeParentVisible = function (visArray, node) {
   if (node.arrayIdx === 0 || visArray[node.parent.arrayIdx]) {
     return; // this is the root of the tree or the parent was already visibile
   }
@@ -210,6 +209,18 @@ export const makeParentVisible = function (visArray, node) {
   makeParentVisible(visArray, node.parent);
 };
 
+/**
+ * Create a visibility array to show the path through the tree to the selected tip
+ * @param  {array} nodes redux tree nodes
+ * @param  {int} tipIdx idx of the selected tip
+ * @return {array} visibility array (values of "visible" | "hidden")
+ */
+export const identifyPathToTip = (nodes, tipIdx) => {
+  const visibility = new Array(nodes.length).fill(false);
+  visibility[tipIdx] = true;
+  makeParentVisible(visibility, nodes[tipIdx]); /* recursive */
+  return visibility.map((cv) => cv ? "visible" : "hidden");
+};
 
 /* calcVisibility
 USES:
@@ -237,14 +248,10 @@ FILTERS:
 */
 export const calcVisibility = function (tree, controls) {
   if (tree.nodes) {
-    let visibility;
-
-    // TIME FILTERING (internal + terminal nodes)
-    const lowerLimit = controls.dateScale(controls.dateFormat.parse(controls.dateMin)); // convert caldate to numdate
-    const upperLimit = controls.dateScale(controls.dateFormat.parse(controls.dateMax)); // convert caldate to numdate
-    visibility = tree.nodes.map((d) => (
-      d.attr.num_date >= lowerLimit && d.attr.num_date <= upperLimit
-    ));
+    /* reset visibility */
+    let visibility = tree.nodes.map((d) => {
+      return true;
+    });
 
     // if we have an analysis slider active, then we must filter on that as well
     // note that min date for analyis doesnt apply
@@ -292,6 +299,15 @@ export const calcVisibility = function (tree, controls) {
       /* intersect visibility and filtered */
       visibility = visibility.map((cv, idx) => (cv && filtered[idx]));
     }
+
+    // TIME FILTERING (internal + terminal nodes)
+    const userDateMin = controls.dateScale(controls.dateFormat.parse(controls.dateMin)); // convert caldate to numdate
+    const userDateMax = controls.dateScale(controls.dateFormat.parse(controls.dateMax)); // convert caldate to numdate
+    const timeFiltered = tree.nodes.map((d, idx) => {
+      return !(d.attr.num_date < userDateMin || d.parent.attr.num_date > userDateMax);
+    });
+    visibility = visibility.map((cv, idx) => (cv && timeFiltered[idx]));
+
     /* return array of "visible" or "hidden" values */
     return visibility.map((cv) => cv ? "visible" : "hidden");
   }
