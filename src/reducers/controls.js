@@ -6,6 +6,7 @@ import moment from 'moment';
 import d3 from "d3";
 import { determineColorByGenotypeType } from "../util/urlHelpers";
 import { floatDateToMoment } from "../util/dateHelpers";
+import maxBy from "lodash";
 
 const checkColorByConfidence = function (attrs, colorBy) {
   return colorBy !== "num_date" && attrs.indexOf(colorBy + "_confidence") > -1;
@@ -16,6 +17,17 @@ const getMinDateViaRoot = function (rootAttr) {
   root.subtract(1, "days"); /* slider should be earlier than actual day */
   return root;
 };
+
+const getMaxDateViaTips = function (tree) {
+  const nodes = d3.layout.tree().nodes(tree);
+  const latestTip = _.maxBy(nodes, function(node) { return node.attr.num_date; });
+  let maxTipDate = floatDateToMoment(latestTip.attr.num_date);
+  maxTipDate.add(1, "days"); /* slider should be later than actual day */
+  return maxTipDate;
+};
+
+
+
 
 /* defaultState is a fn so that we can re-create it
 at any time, e.g. if we want to revert things (e.g. on dataset change)
@@ -57,12 +69,19 @@ const getDefaultState = function () {
 
 const Controls = (state = getDefaultState(), action) => {
   switch (action.type) {
+  case types.DATA_INVALID:
+    return Object.assign({}, state, {
+      datasetPathName: undefined
+    });
   case types.NEW_DATASET:
     const base = getDefaultState();
     base["datasetPathName"] = action.datasetPathName;
     const rootDate = getMinDateViaRoot(action.tree.attr);
     base["dateMin"] = rootDate.format("YYYY-MM-DD");
     base["absoluteDateMin"] = rootDate.format("YYYY-MM-DD");
+    const maxTipDate = getMaxDateViaTips(action.tree);
+    base["dateMax"] = maxTipDate.format("YYYY-MM-DD");
+    base["absoluteDateMax"] = maxTipDate.format("YYYY-MM-DD");
     /* overwrite base state with data from the metadata JSON */
     if (action.meta.date_range) {
       if (action.meta.date_range.date_min) {
@@ -77,7 +96,8 @@ const Controls = (state = getDefaultState(), action) => {
         base["dateMax"] = action.meta.date_range.date_max;
         base["absoluteDateMax"] = action.meta.date_range.date_max;
       }
-    }
+    };
+
     if (action.meta.analysisSlider) {
       base["analysisSlider"] = {key: action.meta.analysisSlider, valid: false};
     }
@@ -199,7 +219,7 @@ const Controls = (state = getDefaultState(), action) => {
     return Object.assign({}, state, {
       distanceMeasure: action.data
     });
-  case types.CHANGE_SELECTED_DATES:
+  case types.CHANGE_DATES_VISIBILITY_THICKNESS:
     return Object.assign({}, state, {
       dateMin: action.dateMin ? action.dateMin : state.dateMin,
       dateMax: action.dateMax ? action.dateMax : state.dateMax

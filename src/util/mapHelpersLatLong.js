@@ -1,251 +1,410 @@
 import {averageColors} from "./colorHelpers";
 import {getTipColorAttribute} from "./treeHelpers";
 
+// longs of original map are -180 to 180
+// longs of fully triplicated map are -540 to 540
+// restrict to longs between -360 to 360
+const westBound = -360;
+const eastBound = 360;
 
-const aggregated = (nodes, visibility, geoResolution, nodeColors) => {
-  const aggregatedLocations = {}; /* demes */
-  const aggregatedLocationsWraparoundCopy = {}; /* edges, animation paths */
-  const aggregatedTransmissions = {}; /* edges, animation paths */
+/* interchange. this is a leaflet method that will tell d3 where to draw.
+-Note (A) we MAY have to do this every time rather than just once */
+const leafletLatLongToLayerPoint = (lat, long, map) => {
+  return map.latLngToLayerPoint(new L.LatLng(lat, long))
+}
 
-  /*
-    walk through nodes and collect a bunch of arrays...
-    can count how many times observe a tip and make an array of an attribute,
-    which in this case will be color,
-    could be an array of hexes which would be enough,
-    similar operation for each transmissino -
-    for each deme pair observe how many and record a hex value from the from deme and
-    count them for width and average to get color
-  */
+/* if transmission pair is legal, return a leaflet LatLng origin / dest pair
+otherwise return null */
+const maybeGetTransmissionPair = (latOrig, longOrig, latDest, longDest, map) => {
 
-  /*
-    aggregate locations for demes
-  */
-  // first pass to initialize empty vectors
+  // if either origin or destination are inside bounds, include
+  // transmission must be less than 180 lat difference
+  if (
+    (longOrig > westBound || longDest > westBound) &&
+    (longOrig < eastBound || longDest < eastBound) &&
+    (Math.abs(longOrig - longDest) < 180)
+  ) {
+    return [
+      leafletLatLongToLayerPoint(latOrig, longOrig, map),
+      leafletLatLongToLayerPoint(latDest, longDest, map)
+    ];
+  }
+  else {
+    return null;
+  }
+}
+
+const setupDemeData = (nodes, visibility, geoResolution, nodeColors, triplicate, metadata, map) => {
+
+  const demeData = []; /* deme array */
+  const demeIndices = {}; /* map of name to indices in array */
+
+  // do aggregation as intermediate step
+  let demeMap = {};
   nodes.forEach((n, i) => {
     if (!n.children) {
-      if (!aggregatedLocations[n.attr[geoResolution]]) {
-        aggregatedLocations[n.attr[geoResolution]] = [];
-        aggregatedLocationsWraparoundCopy[n.attr[geoResolution]] = [];
+      if (n.attr[geoResolution]) { // check for undefined
+        if (!demeMap[n.attr[geoResolution]]) {
+          demeMap[n.attr[geoResolution]] = [];
+        }
       }
     }
-    if (n.children) {
-      n.children.forEach((child) => {
-        if (n.attr[geoResolution] !== child.attr[geoResolution]) {
-          const transmission = n.attr[geoResolution] + "|" + child.attr[geoResolution] + "@" +
-                               n.strain + "|" + child.strain + "@" +
-                               n.arrayIdx + "|" + child.arrayIdx;
-          if (!aggregatedTransmissions[transmission]) {
-            aggregatedTransmissions[transmission] = [];
-          }
-        }
-      });
-    }
   });
+
   // second pass to fill vectors
   nodes.forEach((n, i) => {
     /* demes only count terminal nodes */
     if (!n.children && visibility[i] === "visible") {
       // if tip and visible, push
-      aggregatedLocations[n.attr[geoResolution]].push(nodeColors[i]);
+      if (n.attr[geoResolution]) { // check for undefined
+        demeMap[n.attr[geoResolution]].push(nodeColors[i]);
+      }
     }
-    /* transmissions count internal node transitions as well
-    they are from the parent of the node to the node itself
-    */
+  });
+
+  let offsets = triplicate ? [-360, 0, 360] : [0]
+  const geo = metadata.geo;
+
+  let index = 0;
+  offsets.forEach((OFFSET) => {
+    /* count DEMES */
+    _.forOwn(demeMap, (value, key) => { // value: hash color array, key: deme name
+      let lat = geo[geoResolution][key].latitude;
+      let long = geo[geoResolution][key].longitude + OFFSET;
+
+      if (long > westBound && long < eastBound) {
+
+        const deme = {
+          name: key,
+          count: value.length,
+          color: averageColors(value),
+          latitude: lat, // raw latitude value
+          longitude: long, // raw longitude value
+          coords: leafletLatLongToLayerPoint(lat, long, map) // coords are x,y plotted via d3
+        }
+        demeData.push(deme);
+
+        if (!demeIndices[key]) {
+          demeIndices[key] = [index];
+        } else{
+          demeIndices[key].push(index);
+        }
+        index += 1;
+
+      }
+    });
+  });
+
+  return {
+    demeData: demeData,
+    demeIndices: demeIndices
+  }
+
+}
+
+const maybeConstructTransmissionEvent = (
+  node,
+  child,
+  metadataGeoLookupTable,
+  geoResolution,
+  nodeColors,
+  visibility,
+  map,
+  offsetOrig,
+  offsetDest
+) => {
+
+  let latOrig, longOrig, latDest, longDest;
+  let transmission = null;
+
+  /* checking metadata for lat longs name match - ie., does the metadata list a latlong for Thailand?*/
+  try {
+    // node.attr[geoResolution] is the node's location, we're looking that up in the metadata lookup table
+    latOrig = metadataGeoLookupTable[geoResolution][node.attr[geoResolution]].latitude;
+    longOrig = metadataGeoLookupTable[geoResolution][node.attr[geoResolution]].longitude;
+    latDest = metadataGeoLookupTable[geoResolution][child.attr[geoResolution]].latitude;
+    longDest = metadataGeoLookupTable[geoResolution][child.attr[geoResolution]].longitude;
+  } catch (e) {
+    // console.warn("No transmission lat/longs for ", countries[0], " -> ", countries[1], "If this wasn't fired in the context of a dataset change, it's probably a bug.")
+    return;
+  }
+
+  const validLatLongPair = maybeGetTransmissionPair(
+    latOrig,
+    longOrig + offsetOrig,
+    latDest,
+    longDest + offsetDest,
+    map
+  );
+
+  if (validLatLongPair) {
+    /* build up transmissions object */
+    transmission = {
+      id: node.arrayIdx.toString() + "-" + child.arrayIdx.toString(),
+      originNode: node,
+      destinationNode: child,
+      originName: node.attr[geoResolution],
+      destinationName: child.attr[geoResolution],
+      originCoords: validLatLongPair[0], // after interchange
+      destinationCoords: validLatLongPair[1], // after interchange
+      originLatitude: latOrig, // raw latitude value
+      destinationLatitude: latDest, // raw latitude value
+      originLongitude: longOrig + offsetOrig, // raw longitude value
+      destinationLongitude: longDest + offsetDest, //raw longitude value
+      originNumDate: node.attr["num_date"],
+      destinationNumDate: child.attr["num_date"],
+      color: nodeColors[node.arrayIdx],
+      visible: visibility[child.arrayIdx] === "visible" ? "visible" : "hidden", // transmission visible if child is visible
+    }
+  }
+
+  return transmission;
+}
+
+const maybeGetClosestTransmissionEvent = (
+  node,
+  child,
+  metadataGeoLookupTable,
+  geoResolution,
+  nodeColors,
+  visibility,
+  map,
+  offsetOrig
+) => {
+  const possibleEvents = [];
+  let closestEvent;
+
+  // iterate over offsets applied to transmission destination
+  // even if map is not tripled - ie., don't let a line go across the whole world
+  [-360, 0, 360].forEach((offsetDest) => {
+    const t = maybeConstructTransmissionEvent(
+      node,
+      child,
+      metadataGeoLookupTable,
+      geoResolution,
+      nodeColors,
+      visibility,
+      map,
+      offsetOrig,
+      offsetDest
+    );
+    if (t) { possibleEvents.push(t); }
+  });
+
+  if (possibleEvents.length === 0) { return; }
+
+  closestEvent = _.minBy(possibleEvents, (event) => {
+    return Math.abs(event.destinationCoords.x - event.originCoords.x)
+  });
+
+  return closestEvent;
+}
+
+const setupTransmissionData = (
+  nodes,
+  visibility,
+  geoResolution,
+  nodeColors,
+  triplicate,
+  metadata,
+  map
+) => {
+
+  let offsets = triplicate ? [-360, 0, 360] : [0]
+  const metadataGeoLookupTable = metadata.geo;
+  const transmissionData = []; /* edges, animation paths */
+  const transmissionIndices = {}; /* map of transmission id to array of indices */
+
+  nodes.forEach((n, i) => {
     if (n.children) {
       n.children.forEach((child) => {
-        /* only draw transmissions if
-        (1) the node & child aren't the same location and
-        (2) if child is visibile
-        */
-        if (n.attr[geoResolution] !== child.attr[geoResolution] &&
-          visibility[child.arrayIdx] === "visible") {
-          // make this a pair of indices that point to nodes
-          // this is flatter and self documenting
-          const transmission = n.attr[geoResolution] + "|" + child.attr[geoResolution] + "@" +
-                               n.strain + "|" + child.strain + "@" +
-                               n.arrayIdx + "|" + child.arrayIdx;
-          aggregatedTransmissions[transmission] = [nodeColors[i]];
+        if (
+          n.attr[geoResolution] &&
+          child.attr[geoResolution] &&
+          n.attr[geoResolution] !== child.attr[geoResolution]
+        ) {
+          // offset is applied to transmission origin
+          offsets.forEach((offsetOrig) => {
+            const t = maybeGetClosestTransmissionEvent(
+              n,
+              child,
+              metadataGeoLookupTable,
+              geoResolution,
+              nodeColors,
+              visibility,
+              map,
+              offsetOrig,
+            );
+            if (t) { transmissionData.push(t) }
+          });
         }
       });
     }
   });
-  return {
-    aggregatedLocations,
-    aggregatedLocationsWraparoundCopy,
-    aggregatedTransmissions
-  }
-}
 
-export const getLatLongs = (nodes, visibility, metadata, map, colorBy, geoResolution, triplicate, nodeColors) => {
-
-  let offsets = triplicate ? [-360, 0, 360] : [0]
-
-  const {
-    aggregatedLocations,
-    // aggregatedLocationsWraparoundCopy,
-    aggregatedTransmissions
-  } = aggregated(nodes, visibility, geoResolution, nodeColors);
-  const geo = metadata.geo;
-  const demesAndTransmissions = {
-    demes: [],
-    transmissions: []
-  };
-
-  offsets.forEach((OFFSET) => {
-    /* count DEMES */
-    _.forOwn(aggregatedLocations, (value, key) => {
-      demesAndTransmissions.demes.push({
-        location: key, // Thailand:
-        total: value.length, // 20, this is an array of all demes of a certain type
-        color: averageColors(value),
-        coords: map.latLngToLayerPoint( /* interchange. this is a leaflet method that will tell d3 where to draw. -Note (A) we MAY have to do this every time rather than just once */
-          new L.LatLng(
-            metadata.geo[geoResolution][key].latitude,
-            metadata.geo[geoResolution][key].longitude + OFFSET
-          )
-        )
-      });
-    });
+  transmissionData.forEach((transmission, index) => {
+    if (!transmissionIndices[transmission.id]) {
+      transmissionIndices[transmission.id] = [index];
+    } else {
+      transmissionIndices[transmission.id].push(index);
+    }
   })
 
+  return {
+    transmissionData: transmissionData,
+    transmissionIndices: transmissionIndices
+  }
 
-  // /* count WRAPAROUNDS */
-  // _.forOwn(aggregatedLocationsWraparoundCopy, (value, key) => {
-  //   demesAndTransmissions.demes.push({
-  //     location: key, // Thailand:
-  //     total: value.length, // 20, this is an array of all demes of a certain type
-  //     color: averageColors(value),
-  //     coords: map.latLngToLayerPoint( /* interchange. this is a leaflet method that will tell d3 where to draw. -Note (A) we MAY have to do this every time rather than just once */
-  //       new L.LatLng(
-  //         metadata.geo[geoResolution][key].latitude,
-  //         metadata.geo[geoResolution][key].longitude + 360
-  //       )
-  //     )
-  //   });
-  // });
+}
 
-  // const knownShortestPaths = {};
+export const createDemeAndTransmissionData = (nodes, visibility, geoResolution, nodeColors, triplicate, metadata, map) => {
 
+  /*
+    walk through nodes and collect all data
+    for demeData we have:
+      name, coords, count, color
+    for transmissionData we have:
+      originNode, destinationNode, originCoords, destinationCoords, originName, destinationName
+      originNumDate, destinationNumDate, color, visible
+  */
 
-  offsets.forEach((OFFSET) => {
+  const {
+    demeData,
+    demeIndices
+  } = setupDemeData(nodes, visibility, geoResolution, nodeColors, triplicate, metadata, map);
 
-    /* count TRANSMISSIONS for line thickness */
-    _.forOwn(aggregatedTransmissions, (value, key) => {
+  const {
+    transmissionData,
+    transmissionIndices
+  } = setupTransmissionData(nodes, visibility, geoResolution, nodeColors, triplicate, metadata, map);
 
-      const countries = key.split("@")[0].split("|");
-
-      // /* we already know the path for china to us because we've already done us to china */
-      // if (
-      //   knownShortestPaths[countries[0] + "/" + countries[1]] ||
-      //   knownShortestPaths[countries[1] + "/" + countries[0]]
-      // ) {
-      //   /* use the one we already know about from knownShortestPaths. */
-      // } else {
-      //   /* figure out the new one, insert it AND ITS REVERSE into the knownShortestPaths map above */
-      // }
-
-      let long0;
-      let long1;
-      let lat0;
-      let lat1;
-      try {
-        long0 = geo[geoResolution][countries[0]].longitude;
-        long1 = geo[geoResolution][countries[1]].longitude;
-        lat0 = geo[geoResolution][countries[0]].latitude;
-        lat1 = geo[geoResolution][countries[1]].latitude;
-      } catch (e) {
-        // console.log("No transmission lat/longs for ", countries[0], " -> ", countries[1])
-        return;
-      }
-
-      const original = [
-        map.latLngToLayerPoint( /* interchange. this is a leaflet method that will tell d3 where to draw. -Note (A) We may have to do this every time */
-          new L.LatLng(
-            lat0,
-            long0 + OFFSET
-          )
-        ),
-        map.latLngToLayerPoint( /* interchange. this is a leaflet method that will tell d3 where to draw. -Note (A) We may have to do this every time */
-          new L.LatLng(
-            lat1,
-            long1 + OFFSET
-          )
-        )
-      ];
-
-      const west = [
-        map.latLngToLayerPoint( /* interchange. this is a leaflet method that will tell d3 where to draw. -Note (A) We may have to do this every time */
-          new L.LatLng(
-            lat0,
-            long0 + OFFSET
-          )
-        ),
-        map.latLngToLayerPoint( /* interchange. this is a leaflet method that will tell d3 where to draw. -Note (A) We may have to do this every time */
-          new L.LatLng(
-            lat1,
-            long1 - 360 + OFFSET
-          )
-        )
-      ];
-
-      const east = [
-        map.latLngToLayerPoint( /* interchange. this is a leaflet method that will tell d3 where to draw. -Note (A) We may have to do this every time */
-          new L.LatLng(
-            lat0,
-            long0 + OFFSET
-          )
-        ),
-        map.latLngToLayerPoint( /* interchange. this is a leaflet method that will tell d3 where to draw. -Note (A) We may have to do this every time */
-          new L.LatLng(
-            lat1,
-            long1 + 360 + OFFSET
-          )
-        )
-      ];
-
-      let originToDestinationXYs;
-
-      /* this gives us an index for both demes in the transmission pair with which we will access the node array */
-      const winningPair = _.minBy([original, west, east], (pair) => { return Math.abs(pair[1].x - pair[0].x) });
-
-      const transmission = {
-        demePairIndices: key.split("@")[2].split("|"), /* this has some weird values occassionally that do not presently break anything. created/discovered during animation work. */
-        originToDestinationXYs: winningPair,
-        // originToDestinationXYs: Bezier(winningPair[0],computeMidpoint(winningPair),winningPair[1]),
-        // originToDestinationXYs: original,
-        total: value.length, /* changes over time */
-        color: averageColors(value), /* changes over time */
-      }
-
-
-      demesAndTransmissions.transmissions.push({data: transmission})
-    });
-
-  }) /* End OFFSET */
-
+  let minTransmissionDate;
   // console.log("This is a transmission from mapHelpersLatLong.js: ", demesAndTransmissions)
-  if (demesAndTransmissions.transmissions.length) {
-    demesAndTransmissions.minTransmissionDate = demesAndTransmissions.transmissions.map((x) => {
-      return nodes[x.data.demePairIndices[0]].attr.num_date;
+  if (transmissionData.length) {
+    minTransmissionDate = transmissionData.map((x) => {
+      return transmissionData.originNumDate;
     }).reduce((prev, cur) => {
       return cur < prev ? cur : prev;
     });
   }
-  return demesAndTransmissions;
+
+  return {
+    demeData: demeData,
+    transmissionData: transmissionData,
+    demeIndices: demeIndices,
+    transmissionIndices: transmissionIndices,
+    minTransmissionDate
+  }
 }
 
-/* we used to return this in transmission */
-// create new leaflet LatLong objects
-// const start = new L.LatLng(lat0, long0)
-// const end = new L.LatLng(lat1, long1)
-// start, /* changes with zoom level */
-// end, /* changes with zoom level */
-// from: countries[0],
-// to: countries[1]
+const updateDemeDataColAndVis = (demeData, demeIndices, nodes, visibility, geoResolution, nodeColors) => {
 
-/* we used to compute this... likely with geodesic from leaflet */
-// const dlambda = Math.abs((long1-long0)%360)*Math.PI/180.0;
-// const angle = Math.acos(Math.sin(lat1*Math.PI/180.0)*Math.sin(lat0*Math.PI/180.0)
-//                         + Math.cos(lat1*Math.PI/180.0)*Math.cos(lat0*Math.PI/180.0)*Math.cos(dlambda));
-// // this sets the number of segments of the path, min 4, max 36 for half way around the globe
-// const nSteps = Math.ceil(Math.max(4,angle*36/Math.PI));
+  // initialize empty map
+  let demeMap = {};
+  _.forOwn(demeIndices, (value, key) => { // value: array of indices, key: deme name
+    demeMap[key] = [];
+  });
+
+  // second pass to fill vectors
+  nodes.forEach((n, i) => {
+    /* demes only count terminal nodes */
+    if (!n.children && visibility[i] === "visible") {
+      // if tip and visible, push
+      if (n.attr[geoResolution]) { // check for undefined
+        demeMap[n.attr[geoResolution]].push(nodeColors[i]);
+      }
+    }
+  });
+
+  // update demeData, for each deme, update all elements via demeIndices lookup
+  _.forOwn(demeMap, (value, key) => { // value: hash color array, key: deme name
+    const name = key;
+    demeIndices[name].forEach((index) => {
+      demeData[index].count = value.length;
+      demeData[index].color = averageColors(value);
+    })
+  });
+
+}
+
+const updateTransmissionDataColAndVis = (transmissionData, transmissionIndices, nodes, visibility, geoResolution, nodeColors) => {
+
+  nodes.forEach((node, i) => {
+    if (node.children) {
+      node.children.forEach((child) => {
+        if (
+          node.attr[geoResolution] &&
+          child.attr[geoResolution] &&
+          node.attr[geoResolution] !== child.attr[geoResolution]
+        ) {
+
+          // this is a transmission event from n to child
+          const id = node.arrayIdx.toString() + "-" + child.arrayIdx.toString();
+          const col = nodeColors[node.arrayIdx];
+          const vis = visibility[child.arrayIdx] === "visible" ? "visible" : "hidden"; // transmission visible if child is visible
+
+          // update transmissionData via index lookup
+          transmissionIndices[id].forEach((index) => {
+            transmissionData[index].color = col;
+            transmissionData[index].visible = vis;
+          })
+
+        }
+      });
+    }
+  });
+
+}
+
+export const updateDemeAndTransmissionDataColAndVis = (demeData, transmissionData, demeIndices, transmissionIndices, nodes, visibility, geoResolution, nodeColors) => {
+
+  /*
+    walk through nodes and update attributes that can mutate
+    for demeData we have:
+      count, color
+    for transmissionData we have:
+      color, visible
+  */
+
+  if (demeData && transmissionData) {
+    updateDemeDataColAndVis(demeData, demeIndices, nodes, visibility, geoResolution, nodeColors);
+    updateTransmissionDataColAndVis(transmissionData, transmissionIndices, nodes, visibility, geoResolution, nodeColors);
+  }
+
+}
+
+const updateDemeDataLatLong = (demeData, map) => {
+
+  // interchange for all demes
+  demeData.forEach((d,i) => {
+    d.coords = leafletLatLongToLayerPoint(d.latitude, d.longitude, map);
+  });
+
+}
+
+const updateTransmissionDataLatLong = (transmissionData, map) => {
+
+  // interchange for all transmissions
+  transmissionData.forEach((transmission,i) => {
+    transmission.originCoords = leafletLatLongToLayerPoint(transmission.originLatitude, transmission.originLongitude, map);
+    transmission.destinationCoords = leafletLatLongToLayerPoint(transmission.destinationLatitude, transmission.destinationLongitude, map);
+  });
+
+}
+
+export const updateDemeAndTransmissionDataLatLong = (demeData, transmissionData, map) => {
+
+  /*
+    walk through nodes and update attributes that can mutate
+    for demeData we have:
+      count, color
+    for transmissionData we have:
+      color, visible
+  */
+
+  if (demeData && transmissionData) {
+    updateDemeDataLatLong(demeData, map);
+    updateTransmissionDataLatLong(transmissionData, map);
+  }
+
+}

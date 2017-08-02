@@ -2,17 +2,24 @@
 /*eslint max-len: 0*/
 import React from "react";
 import d3 from "d3";
-import _ from "lodash";
-import moment from "moment";
 import { connect } from "react-redux";
 import Card from "../framework/card";
-import {changeDateFilter} from "../../actions/treeProperties";
+
+import { numericToCalendar, calendarToNumeric } from "../../util/dateHelpers";
 import setupLeaflet from "../../util/leaflet";
 import setupLeafletPlugins from "../../util/leaflet-plugins";
-import {drawDemesAndTransmissions, updateOnMoveEnd, updateVisibility} from "../../util/mapHelpers";
-import * as globals from "../../util/globals";
+import { drawDemesAndTransmissions, updateOnMoveEnd, updateVisibility } from "../../util/mapHelpers";
+import { enableAnimationDisplay, animationWindowWidth, animationTick, twoColumnBreakpoint } from "../../util/globals";
 import computeResponsive from "../../util/computeResponsive";
 import {getLatLongs} from "../../util/mapHelpersLatLong";
+import { modifyURLquery } from "../../util/urlHelpers";
+import { 
+  createDemeAndTransmissionData, 
+  updateDemeAndTransmissionDataColAndVis, 
+  updateDemeAndTransmissionDataLatLong 
+} from "../../util/mapHelpersLatLong";
+
+import { changeDateFilter } from "../../actions/treeProperties";
 import {
   CHANGE_ANIMATION_START,
   CHANGE_ANIMATION_TIME,
@@ -23,9 +30,11 @@ import {
 @connect((state) => {
   return {
     // datasetGuid: state.tree.datasetGuid,
+    absoluteDateMin: state.controls.absoluteDateMin,
+    absoluteDateMax: state.controls.absoluteDateMax,
     treeVersion: state.tree.version,
     treeLoaded: state.tree.loaded,
-    controls: state.controls,
+    splitTreeAndMap: state.controls.splitTreeAndMap,
     nodes: state.tree.nodes,
     nodeColors: state.tree.nodeColors,
     visibility: state.tree.visibility,
@@ -33,14 +42,16 @@ import {
     metadata: state.metadata.metadata,
     browserDimensions: state.browserDimensions.browserDimensions,
     colorScaleVersion: state.controls.colorScale.version,
-    colorBy: state.controls.colorBy,
     map: state.map,
     geoResolution: state.controls.geoResolution,
-    // mapAnimationStartDate: state.controls.mapAnimationStartDate,
     mapAnimationDurationInMilliseconds: state.controls.mapAnimationDurationInMilliseconds,
     mapAnimationCumulative: state.controls.mapAnimationCumulative,
     mapAnimationPlayPauseButton: state.controls.mapAnimationPlayPauseButton,
-    mapTriplicate: state.controls.mapTriplicate
+    mapTriplicate: state.controls.mapTriplicate,
+    dateMin: state.controls.dateMin,
+    dateMax: state.controls.dateMax,
+    dateScale: state.controls.dateScale,
+    dateFormat: state.controls.dateFormat,
   };
 })
 
@@ -49,13 +60,18 @@ class Map extends React.Component {
     super(props);
     this.state = {
       map: null,
-      demes: false,
-      latLongs: null,
       d3DOMNode: null,
       d3elems: null,
       // datasetGuid: null,
       responsive: null,
+      demeData: null,
+      transmissionData: null,
+      demeIndices: null,
+      transmissionIndices: null
     };
+  }
+  static contextTypes = {
+    router: React.PropTypes.object.isRequired
   }
   static propTypes = {
     treeVersion: React.PropTypes.number.isRequired,
@@ -84,7 +100,6 @@ class Map extends React.Component {
     this.maybeSetupD3DOMNode(); /* attaches the D3 SVG DOM node to the Leaflet DOM node, only done once */
     this.maybeDrawDemesAndTransmissions(prevProps); /* it's the first time, or they were just removed because we changed dataset or colorby or resolution */
     this.maybeUpdateDemesAndTransmissions(prevProps); /* every time we change something like colorBy */
-    // this.maybeAnimateDemesAndTransmissions();
   }
   maybeCreateLeafletMap() {
     /* first time map, this sets up leaflet */
@@ -108,7 +123,17 @@ class Map extends React.Component {
       treeChanged: this.props.treeVersion !== nextProps.treeVersion, // treeVersion change implies tree is ready (modified by the same action)
       sidebarChanged: this.props.sidebar !== nextProps.sidebar
     };
-    if (Object.values(changes).some((v) => v === true)) {
+    // Object.values would be the obvious thing to do here
+    // but not supported in many browsers including iOS Safari
+    let somethingChanged = false;
+    for (var property in changes) {
+      if (changes.hasOwnProperty(property)) {
+        if (changes[property] === true) {
+          somethingChanged = true;
+        }
+      }
+    }
+    if (somethingChanged) {
       this.setState({responsive: this.doComputeResponsive(nextProps)});
     }
     // if (
@@ -132,7 +157,7 @@ class Map extends React.Component {
   }
   doComputeResponsive(nextProps) {
     return computeResponsive({
-      horizontal: nextProps.browserDimensions.width > globals.twoColumnBreakpoint && (this.props.controls && this.props.controls.splitTreeAndMap) ? .5 : 1,
+      horizontal: nextProps.browserDimensions.width > twoColumnBreakpoint && (this.props.splitTreeAndMap) ? .5 : 1,
       vertical: 1.0, /* if we are in single column, full height */
       browserDimensions: nextProps.browserDimensions,
       sidebar: nextProps.sidebar,
@@ -152,11 +177,9 @@ class Map extends React.Component {
   }
   maybeDrawDemesAndTransmissions(prevProps) {
 
-    /* before April 2017 we fired this every time */
-
     const mapIsDrawn = !!this.state.map;
     const allDataPresent = !!(this.props.metadata && this.props.treeLoaded && this.state.responsive && this.state.d3DOMNode);
-    const demesAbsent = !this.state.demes;
+    const demesTransmissionsComputed = !this.state.demeData && !this.state.transmissionData;
 
     /* if at any point we change dataset and app doesn't remount, we'll need these again */
     // const newColorScale = this.props.colorScale.version !== prevProps.colorScale.version;
@@ -169,7 +192,7 @@ class Map extends React.Component {
       // this.props.datasetGuid &&
       mapIsDrawn &&
       allDataPresent &&
-      demesAbsent
+      demesTransmissionsComputed
     ) {
       /* data structures to feed to d3 latLongs = { tips: [{}, {}], transmissions: [{}, {}] } */
       if (!this.state.boundsSet){ //we are doing the initial render -> set map to the range of the data
@@ -179,13 +202,32 @@ class Map extends React.Component {
 
       this.state.map.setMaxBounds(this.getBounds())
 
-      const latLongs = this.latLongs(); /* no reference stored, we recompute this for now rather than updating in place */
+      const {
+        demeData,
+        transmissionData,
+        demeIndices,
+        transmissionIndices,
+        minTransmissionDate
+      } = createDemeAndTransmissionData(
+        this.props.nodes,
+        this.props.visibility,
+        this.props.geoResolution,
+        this.props.nodeColors,
+        this.props.mapTriplicate,
+        this.props.metadata,
+        this.state.map
+      );
+
+      // const latLongs = this.latLongs(demeData, transmissionData); /* no reference stored, we recompute this for now rather than updating in place */
       const d3elems = drawDemesAndTransmissions(
-        latLongs,
+        demeData,
+        transmissionData,
         this.state.d3DOMNode,
         this.state.map,
         this.props.nodes,
-        this.props.controls
+        calendarToNumeric(this.props.dateFormat, this.props.dateScale, this.props.dateMin),
+        calendarToNumeric(this.props.dateFormat, this.props.dateScale, this.props.dateMax),
+        minTransmissionDate
       );
 
       /* Set up leaflet events */
@@ -195,18 +237,20 @@ class Map extends React.Component {
       // don't redraw on every rerender - need to seperately handle virus change redraw
       this.setState({
         boundsSet: true,
-        demes: true,
         d3elems,
-        latLongs,
+        demeData,
+        transmissionData,
+        demeIndices,
+        transmissionIndices
       });
     }
   }
   maybeRemoveAllDemesAndTransmissions(nextProps) {
-    /* as of jul 7 2017, the constructor / omponentDidMount is NOT running
+    /* as of jul 7 2017, the constructor / componentDidMount is NOT running
     on dataset change! */
 
     /*
-      xx dataset change, remove all demes and transmissions d3 added
+      xx dataset change or resolution change, remove all demes and transmissions d3 added
       xx we could also make this smoother: http://bl.ocks.org/alansmithy/e984477a741bc56db5a5
       THE ABOVE IS NO LONGER TRUE: while App remounts, this is all getting nuked, so it doesn't matter.
       Here's what we were doing and might do again:
@@ -219,7 +263,7 @@ class Map extends React.Component {
 
     const mapIsDrawn = !!this.state.map;
     const geoResolutionChanged = this.props.geoResolution !== nextProps.geoResolution;
-    const dataChanged = this.state.demes && (!nextProps.treeLoaded || this.props.treeVersion !== nextProps.treeVersion);
+    const dataChanged = (!nextProps.treeLoaded || this.props.treeVersion !== nextProps.treeVersion);
 
     // (this.props.colorBy !== nextProps.colorBy ||
     //   this.props.visibilityVersion !== nextProps.visibilityVersion ||
@@ -231,15 +275,31 @@ class Map extends React.Component {
       /* clear references to the demes and transmissions d3 added */
       this.setState({
         boundsSet: false,
-        demes: false,
         d3elems: null,
-        latLongs: null,
+        demeData: null,
+        transmissionData: null,
+        demeIndices: null,
+        transmissionIndices: null
       })
     }
   }
   respondToLeafletEvent(leafletEvent) {
     if (leafletEvent.type === "moveend") { /* zooming and panning */
-      updateOnMoveEnd(this.state.d3elems, this.latLongs(), this.props.controls, this.props.nodes);
+
+      updateDemeAndTransmissionDataLatLong(
+        this.state.demeData,
+        this.state.transmissionData,
+        this.state.map);
+
+      updateOnMoveEnd(
+        this.state.demeData,
+        this.state.transmissionData,
+        this.state.minTransmissionDate,
+        this.state.d3elems,
+        calendarToNumeric(this.props.dateFormat, this.props.dateScale, this.props.dateMin),
+        calendarToNumeric(this.props.dateFormat, this.props.dateScale, this.props.dateMax),
+        this.props.nodes
+      );
     }
   }
   getGeoRange() {
@@ -266,44 +326,43 @@ class Map extends React.Component {
   maybeUpdateDemesAndTransmissions(prevProps) {
     /* nothing to update */
     const noMap = !this.state.map;
-    const noDemes = !this.state.demes;
-    if (noMap || noDemes) {return;}
-    const latLongs = this.latLongs(); /* can't run if noMap || noDemes */
-    if (!this.props.treeLoaded || latLongs === null) {return;}
+    if (noMap || !this.props.treeLoaded) { return; }
 
     if (
       this.props.visibilityVersion !== prevProps.visibilityVersion ||
       this.props.colorScaleVersion !== prevProps.colorScaleVersion
     ) {
-      updateVisibility(this.state.d3elems, latLongs, this.props.controls, this.props.nodes);
-    }
-  }
-  // maybeAnimateDemesAndTransmissions() {
-  //   /* todo */
-  // }
-  latLongs() {
-    if (this.props.treeLoaded && this.state.map) {
-      return getLatLongs(
+      updateDemeAndTransmissionDataColAndVis(
+        this.state.demeData,
+        this.state.transmissionData,
+        this.state.demeIndices,
+        this.state.transmissionIndices,
         this.props.nodes,
         this.props.visibility,
-        this.props.metadata,
-        this.state.map,
-        this.props.colorBy,
         this.props.geoResolution,
-        this.props.mapTriplicate,
-        this.props.nodeColors,
+        this.props.nodeColors);
+      updateVisibility(
+        this.state.demeData,
+        this.state.transmissionData,
+        this.state.d3elems,
+        this.state.map,
+        this.props.nodes,
+        calendarToNumeric(this.props.dateFormat, this.props.dateScale, this.props.dateMin),
+        calendarToNumeric(this.props.dateFormat, this.props.dateScale, this.props.dateMax),
+        this.state.minTransmissionDate
       );
     }
-    return null;
+
   }
+
   getBounds() {
     let southWest;
     let northEast;
 
     /* initial map bounds */
     if (this.props.mapTriplicate === true) {
-      southWest = L.latLng(-70, -540);
-      northEast = L.latLng(80, 540);
+      southWest = L.latLng(-70, -360);
+      northEast = L.latLng(80, 360);
     } else {
       southWest = L.latLng(-70, -180);
       northEast = L.latLng(80, 180);
@@ -328,7 +387,7 @@ class Map extends React.Component {
       scrollWheelZoom: false,
       maxBounds: this.getBounds(),
       minZoom: 2,
-      maxZoom: 8,
+      maxZoom: 10,
       zoomControl: false,
       /* leaflet sleep see https://cliffcloud.github.io/Leaflet.Sleep/#summary */
       // true by default, false if you want a wild map
@@ -354,6 +413,51 @@ class Map extends React.Component {
 
     this.setState({map});
   }
+
+  animationButtons() {
+    if (!enableAnimationDisplay) {
+        return null;
+    } else {
+      return (
+        <div>
+        <button style={{
+            position: "absolute",
+            left: 25,
+            top: 25,
+            zIndex: 9999,
+            border: "none",
+            width: 56,
+            padding: 15,
+            borderRadius: 4,
+            backgroundColor: "rgb(124, 184, 121)",
+            fontWeight: 700,
+            color: "white",
+          }}
+          onClick={this.handleAnimationPlayPauseClicked.bind(this) }
+          >
+          {this.props.mapAnimationPlayPauseButton}
+        </button>
+        <button style={{
+            position: "absolute",
+            left: 90,
+            top: 25,
+            zIndex: 9999,
+            border: "none",
+            padding: 15,
+            borderRadius: 4,
+            backgroundColor: "rgb(230, 230, 230)",
+            fontWeight: 700,
+            color: "white"
+          }}
+          onClick={this.handleAnimationResetClicked.bind(this) }
+          >
+          Reset
+        </button>
+        </div>
+      )
+    }
+  }
+
   maybeCreateMapDiv() {
     let container = null;
     if (
@@ -362,39 +466,7 @@ class Map extends React.Component {
     ) {
       container = (
         <div style={{position: "relative"}}>
-          <button style={{
-              position: "absolute",
-              left: 25,
-              top: 25,
-              zIndex: 9999,
-              border: "none",
-              width: 56,
-              padding: 15,
-              borderRadius: 4,
-              backgroundColor: "rgb(124, 184, 121)",
-              fontWeight: 700,
-              color: "white",
-            }}
-          onClick={this.handleAnimationPlayPauseClicked.bind(this) }
-            >
-            {this.props.mapAnimationPlayPauseButton}
-          </button>
-          <button style={{
-              position: "absolute",
-              left: 90,
-              top: 25,
-              zIndex: 9999,
-              border: "none",
-              padding: 15,
-              borderRadius: 4,
-              backgroundColor: "rgb(230, 230, 230)",
-              fontWeight: 700,
-              color: "white"
-            }}
-          onClick={this.handleAnimationResetClicked.bind(this) }
-            >
-            Reset
-          </button>
+          {this.animationButtons()}
           <div style={{
               height: this.state.responsive.height,
               width: this.state.responsive.width
@@ -410,11 +482,11 @@ class Map extends React.Component {
     * ANIMATE MAP (AND THAT LINE ON TREE)
     *****************************************/
     if (this.props.mapAnimationPlayPauseButton === "Play") {
-      this.animateMap();
       this.props.dispatch({
         type: MAP_ANIMATION_PLAY_PAUSE_BUTTON,
         data: "Pause"
       });
+      this.animateMap();
     } else {
       clearInterval(window.NEXTSTRAIN.mapAnimationLoop)
       window.NEXTSTRAIN.mapAnimationLoop = null;
@@ -422,17 +494,19 @@ class Map extends React.Component {
         type: MAP_ANIMATION_PLAY_PAUSE_BUTTON,
         data: "Play"
       });
+      modifyURLquery(this.context.router, {dmin: this.props.dateMin, dmax: this.props.dateMax});
     }
   }
 
   resetAnimation() {
     clearInterval(window.NEXTSTRAIN.mapAnimationLoop);
     window.NEXTSTRAIN.mapAnimationLoop = null;
-    this.props.dispatch(changeDateFilter({newMin: this.props.controls.absoluteDateMin, newMax: this.props.controls.absoluteDateMax}));
+    this.props.dispatch(changeDateFilter({newMin: this.props.absoluteDateMin, newMax: this.props.absoluteDateMax}));
     this.props.dispatch({
       type: MAP_ANIMATION_PLAY_PAUSE_BUTTON,
       data: "Play"
     });
+    modifyURLquery(this.context.router, {dmin: false, dmax: false});
   }
 
   handleAnimationResetClicked() {
@@ -440,16 +514,19 @@ class Map extends React.Component {
   }
   animateMap() {
     /* By default, start at absoluteDateMin; allow overriding via augur default export */
-    // let first = this.props.mapAnimationStartDate ? moment(this.props.dateMin, "YYYY-MM-DD"): moment(this.props.controls.absoluteDateMin, "YYYY-MM-DD");
-    let first = moment(this.props.controls.dateMin);
-    let last = moment(this.props.controls.absoluteDateMax, "YYYY-MM-DD");
-    let numberDays = moment.duration(last.diff(first)).asDays(); // Total number of days in the animation
 
-    const tick = 100; // Length of each tick in milliseconds
-    let incrementBy = Math.ceil((tick*numberDays)/this.props.mapAnimationDurationInMilliseconds); // [(ms * days) / ms] = days
-    const incrementByUnit = "day";
-    const timeSliderWindow = Math.ceil((numberDays / 20)); /* in months for now  */ // this is 1/10 the date range in date slider
-    let second = moment(first, "YYYY-MM-DD").add(timeSliderWindow, "days");
+    // dates are num date format
+    // leftWindow --- rightWindow ------------------------------- end
+    // 2011.4 ------- 2011.6 ------------------------------------ 2015.4
+
+    let start = calendarToNumeric(this.props.dateFormat, this.props.dateScale, this.props.absoluteDateMin);
+    let leftWindow = calendarToNumeric(this.props.dateFormat, this.props.dateScale, this.props.dateMin);
+    let end = calendarToNumeric(this.props.dateFormat, this.props.dateScale, this.props.absoluteDateMax);
+    let totalRange = end - start; // years in the animation
+
+    let animationIncrement = (animationTick * totalRange) / this.props.mapAnimationDurationInMilliseconds; // [(ms * years) / ms] = years eg 100 ms * 5 years / 30,000 ms =  0.01666666667 years
+    const windowRange = animationWindowWidth * totalRange;
+    let rightWindow = leftWindow + windowRange;
 
     if (!window.NEXTSTRAIN) {
       window.NEXTSTRAIN = {}; /* centralize creation of this if we need it anywhere else */
@@ -459,58 +536,30 @@ class Map extends React.Component {
 
     window.NEXTSTRAIN.mapAnimationLoop = setInterval(() => {
 
-      /* first pass sets the timer to absolute min and absolute min + 6 months because they reference above initial time window */
-      this.props.dispatch(changeDateFilter({newMin: first.format("YYYY-MM-DD"), newMax: second.format("YYYY-MM-DD")}));
+      const newWindow = {min: numericToCalendar(this.props.dateFormat, this.props.dateScale, leftWindow),
+        max: numericToCalendar(this.props.dateFormat, this.props.dateScale, rightWindow)};
+
+      /* first pass sets the timer to absolute min and absolute min + windowRange because they reference above initial time window */
+      this.props.dispatch(changeDateFilter({newMin: newWindow.min, newMax: newWindow.max}));
+      // don't modifyURLquery
 
       if (!this.props.mapAnimationCumulative) {
-        first = first.add(incrementBy, incrementByUnit);
+        leftWindow = leftWindow + animationIncrement;
       }
-      second = second.add(incrementBy, incrementByUnit);
+      rightWindow = rightWindow + animationIncrement;
 
-      if (second.valueOf() >= last.valueOf()) {
+      if (rightWindow >= end) {
         clearInterval(window.NEXTSTRAIN.mapAnimationLoop)
         window.NEXTSTRAIN.mapAnimationLoop = null;
-        // this.props.dispatch(changeDateFilter(first.format("YYYY-MM-DD"), second.format("YYYY-MM-DD")));
-        this.props.dispatch(changeDateFilter({newMin: this.props.controls.absoluteDateMin, newMax: this.props.controls.absoluteDateMax}));
+        this.props.dispatch(changeDateFilter({newMin: this.props.absoluteDateMin, newMax: this.props.absoluteDateMax}));
         this.props.dispatch({
           type: MAP_ANIMATION_PLAY_PAUSE_BUTTON,
           data: "Play"
         });
+        modifyURLquery(this.context.router, {dmin: false, dmax: false});
       }
-    }, tick);
+    }, animationTick);
 
-    // controls: state.controls,
-    // this.props.dateMin //"2013-06-28"
-    // this.props.dateMax //"2016-11-21"
-    // this.props.absoluteDateMin //"2013-06-29"
-    // this.props.absoluteDateMax //"2016-11-21"
-    // export const CHANGE_DATE_MIN = "CHANGE_DATE_MIN";
-    // export const CHANGE_DATE_MAX = "CHANGE_DATE_MAX";
-    // export const CHANGE_ABSOLUTE_DATE_MIN = "CHANGE_ABSOLUTE_DATE_MIN";
-    // export const CHANGE_ABSOLUTE_DATE_MAX = "CHANGE_ABSOLUTE_DATE_MAX";
-
-    // =======OLD RAF CODE=======
-    // let start = null;
-    //
-    // const step = (timestamp) => {
-    //   if (!start) start = timestamp;
-    //
-    //   let progress = timestamp - start;
-    //
-    //   this.props.dispatch({
-    //     type: MAP_ANIMATION_TICK,
-    //     data: {
-    //       progress
-    //     }
-    //   })
-    //
-    //   if (progress < globals.mapAnimationDurationInMilliseconds) {
-    //     window.requestAnimationFrame(step);
-    //   } else {
-    //     this.props.dispatch({ type: MAP_ANIMATION_END })
-    //   }
-    // }
-    // window.requestAnimationFrame(step);
   }
   render() {
     // clear layers - store all markers in map state https://github.com/Leaflet/Leaflet/issues/3238#issuecomment-77061011
